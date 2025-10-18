@@ -1,0 +1,119 @@
+name: K3s Build and Deploy (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      services:
+        description: 'JSON array of services to build and deploy'
+        required: true
+        type: string
+      namespace:
+        description: 'Kubernetes namespace'
+        required: true
+        type: string
+      deployment-name:
+        description: 'Main deployment name'
+        required: false
+        type: string
+      job-config:
+        description: 'JSON object for job configuration (name, template)'
+        required: false
+        type: string
+      registry:
+        description: 'Docker registry URL'
+        required: false
+        type: string
+        default: '192.168.2.201:5000'
+      buildkit-endpoint:
+        description: 'BuildKit endpoint'
+        required: false
+        type: string
+        default: 'tcp://buildkit.buildkit.svc.cluster.local:1234'
+
+jobs:
+  build-and-deploy:
+    runs-on: [self-hosted, buildkit]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: remote
+          endpoint: ${{ inputs.buildkit-endpoint }}
+
+      - name: Build and push images
+        id: build
+        run: |
+          SERVICES='${{ inputs.services }}'
+          echo "$SERVICES" | jq -c '.[]' | while read service; do
+            CONTEXT=$(echo "$service" | jq -r '.context')
+            DOCKERFILE=$(echo "$service" | jq -r '.dockerfile // empty')
+            IMAGE=$(echo "$service" | jq -r '.image')
+
+            BUILD_ARGS="--push"
+
+            if [ -n "$DOCKERFILE" ]; then
+              BUILD_ARGS="$BUILD_ARGS --file $DOCKERFILE"
+            fi
+
+            BUILD_ARGS="$BUILD_ARGS --tag ${{ inputs.registry }}/${IMAGE}:${{ github.sha }}"
+            BUILD_ARGS="$BUILD_ARGS --tag ${{ inputs.registry }}/${IMAGE}:latest"
+
+            echo "Building $IMAGE..."
+            docker buildx build $BUILD_ARGS $CONTEXT
+          done
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'latest'
+
+      - name: Configure kubectl for in-cluster access
+        run: |
+          kubectl config set-cluster kubernetes --server=https://kubernetes.default.svc --certificate-authority=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          kubectl config set-credentials runner --token=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+          kubectl config set-context default --cluster=kubernetes --user=runner
+          kubectl config use-context default
+
+      - name: Update deployments
+        run: |
+          SERVICES='${{ inputs.services }}'
+          echo "$SERVICES" | jq -c '.[]' | while read service; do
+            IMAGE=$(echo "$service" | jq -r '.image')
+            CONTAINERS=$(echo "$service" | jq -r '.containers // [] | .[]')
+
+            if [ -z "$CONTAINERS" ]; then
+              echo "No containers specified for $IMAGE, skipping deployment update"
+              continue
+            fi
+
+            echo "$CONTAINERS" | while read container; do
+              if [ -n "$container" ]; then
+                echo "Updating container $container with image $IMAGE..."
+                kubectl set image deployment/${{ inputs.deployment-name }} \
+                  ${container}=${{ inputs.registry }}/${IMAGE}:${{ github.sha }} \
+                  -n ${{ inputs.namespace }}
+              fi
+            done
+          done
+
+      - name: Handle job restart
+        if: inputs.job-config != ''
+        run: |
+          JOB_CONFIG='${{ inputs.job-config }}'
+          JOB_NAME=$(echo "$JOB_CONFIG" | jq -r '.name')
+          JOB_TEMPLATE=$(echo "$JOB_CONFIG" | jq -r '.template // .name')
+
+          echo "Restarting job $JOB_NAME..."
+          kubectl delete job $JOB_NAME -n ${{ inputs.namespace }} --ignore-not-found=true
+          kubectl create job ${JOB_NAME}-${{ github.sha }} \
+            --from=job/$JOB_TEMPLATE -n ${{ inputs.namespace }} || true
+
+      - name: Wait for deployment rollout
+        if: inputs.deployment-name != ''
+        run: |
+          kubectl rollout status deployment/${{ inputs.deployment-name }} \
+            -n ${{ inputs.namespace }} --timeout=5m
